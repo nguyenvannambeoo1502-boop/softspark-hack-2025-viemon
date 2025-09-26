@@ -1,211 +1,179 @@
-/* Combined Light + Sound Test (with proper Sound logic)
- * Serial: 115200
- * Commands: 'c' = recalibrate light, 's' = recalibrate sound, 'h' = help
- */
-
 #include <Arduino.h>
 #include "light.h"
-#include "sound.h"
+#include "dist.h"
 
 // ---------------- Pins ----------------
-static const uint8_t PIN_LIGHT = A0;
-static const uint8_t PIN_MIC   = A1;
+static const uint8_t PIN_LIGHT = A0;   // Light sensor analog
+static const uint8_t PIN_MIC   = A1;   // Sound sensor analog
+static const uint8_t LED_PIN   = 13;   // Built-in LED
+// HC-SR04 -> Arduino Uno wiring: VCC->5V, GND->GND, TRIG->D9, ECHO->D8
+static const uint8_t PIN_TRIG  = 9;
+static const uint8_t PIN_ECHO  = 8;
 
-// ---------------- Light ----------------
-Light gLight(PIN_LIGHT, /*vRef=*/5.0f, /*rFixed=*/10000.0f, /*alpha=*/0.20f);
+// ---------------- Instances ----------------
+Light  gLight(PIN_LIGHT, 5.0f, 10000.0f, 0.20f);
+HCSR04 gRange(PIN_TRIG, PIN_ECHO);
 
-// ---------------- Sound with logic ----------------
-class SoundLogic {
-public:
-  enum State : uint8_t { QUIET = 0, NOISY = 1 };
+// ---------------- Sound Threshold ----------------
+const int SOUND_THRESHOLD = 55;   // adjust experimentally
 
-  // bands are offsets (ADC counts) around baseline
-  // loBand: below baseline+loBand forces QUIET (when coming down)
-  // hiBand: above baseline+hiBand forces NOISY (when going up)
-  SoundLogic(int loBand = 30, int hiBand = 60, float drift = 0.002f)
-  : _baseline(512), _avg(512), _loBand(loBand), _hiBand(hiBand),
-    _beta(constrain(drift, 0.0f, 0.1f)), _primed(false), _state(QUIET) {}
+// ---------------- Study-distance thresholds (OK band) ----------------
+// You are OK within [NEAR .. FAR] cm; outside => warn (with hysteresis)
+const float STUDY_NEAR_CM = 35.0f;   // too close if < NEAR
+const float STUDY_FAR_CM  = 75.0f;   // too far  if > FAR
+const float STUDY_HYST_CM = 3.0f;    // ± hysteresis band
 
-  void begin(uint8_t pin) {
-    sound_begin(pin);
-    _t0 = millis();
-    _primed = false;
-    _acc = 0; _n = 0;
+// ---------------- Helpers ----------------
+static const __FlashStringHelper* lightStateStr(Light::State s) {
+  switch (s) {
+    case Light::TOO_DARK:   return F("DARK");
+    case Light::TOO_BRIGHT: return F("BRIGHT");
+    default:                return F("OK");
   }
-
-  void autoCalibrate(uint32_t ms = 2000) {
-    // collect a quiet-room baseline for 'ms'
-    _acc = 0; _n = 0;
-    uint32_t t0 = millis();
-    while (millis() - t0 < ms) {
-      int v = sound_read_avg();
-      _acc += v; _n++;
-      delay(2);
-    }
-    if (_n > 0) _baseline = (int)(_acc / _n);
-    _primed  = true;
-  }
-
-  void setBands(int loBand, int hiBand) {
-    _loBand = max(0, loBand);
-    _hiBand = max(_loBand + 1, hiBand); // ensure hi > lo
-  }
-
-  void setDrift(float beta) { _beta = constrain(beta, 0.0f, 0.1f); }
-
-  State update() {
-    _avg = sound_read_avg();
-
-    // after calibration, follow slow drift (e.g., temperature, gain)
-    if (_primed) {
-      _baseline = (int)(_baseline + _beta * (float)(_avg - _baseline));
-    } else {
-      // if user skipped autoCalibrate(), do a short rolling mean (1s)
-      if (millis() - _t0 < 1000) {
-        _acc += _avg; _n++;
-        _baseline = (int)(_acc / max(1, _n));
-      } else {
-        _primed = true;
-      }
-    }
-
-    const int hi = _baseline + _hiBand;
-    const int lo = _baseline + _loBand;
-
-    // Hysteresis: go noisy only above hi; return quiet only below lo
-    if (_state == QUIET) {
-      if (_avg > hi) _state = NOISY;
-    } else { // NOISY
-      if (_avg < lo) _state = QUIET;
-    }
-    return _state;
-  }
-
-  // Accessors
-  State state()   const { return _state; }
-  int   avg()     const { return _avg; }
-  int   baseline()const { return _baseline; }
-  int   loBand()  const { return _loBand; }
-  int   hiBand()  const { return _hiBand; }
-  bool  primed()  const { return _primed; }
-
-private:
-  int      _baseline, _avg;
-  int      _loBand, _hiBand;
-  float    _beta;
-  bool     _primed;
-
-  // scratch for initial averaging
-  long     _acc = 0;
-  int      _n   = 0;
-  uint32_t _t0  = 0;
-
-  State    _state;
-};
-
-SoundLogic gSound(/*loBand=*/35, /*hiBand=*/70, /*drift=*/0.002f);
-
-// ---------------- Env logic ----------------
-enum EnvState : uint8_t { ENV_OK=0, ENV_TOO_DARK=1, ENV_TOO_BRIGHT=2, ENV_TOO_NOISY=3 };
-
-EnvState classifyEnv(const Light& L, const SoundLogic& S) {
-  if (S.state() == SoundLogic::NOISY) return ENV_TOO_NOISY;
-  switch (L.state()) {
-    case Light::TOO_DARK:   return ENV_TOO_DARK;
-    case Light::TOO_BRIGHT: return ENV_TOO_BRIGHT;
-    case Light::COMFORT:    return ENV_OK;
-  }
-  return ENV_OK;
 }
 
-static const uint8_t LED = LED_BUILTIN;
+// Distance state as plain bytes (avoid Arduino auto-prototype issues)
+enum { DST_TOO_CLOSE = 0, DST_OK = 1, DST_TOO_FAR = 2 };
 
-const __FlashStringHelper* envName(EnvState s) {
-  switch (s) {
-    case ENV_OK:         return F("OK");
-    case ENV_TOO_DARK:   return F("TOO_DARK");
-    case ENV_TOO_BRIGHT: return F("TOO_BRIGHT");
-    case ENV_TOO_NOISY:  return F("TOO_NOISY");
+static uint8_t evalDistState(uint8_t prev, float d_cm) {
+  if (isnan(d_cm)) return prev; // hold last state if no echo
+  switch (prev) {
+    case DST_OK:
+      if (d_cm < (STUDY_NEAR_CM - STUDY_HYST_CM)) return DST_TOO_CLOSE;
+      if (d_cm > (STUDY_FAR_CM  + STUDY_HYST_CM)) return DST_TOO_FAR;
+      return DST_OK;
+
+    case DST_TOO_CLOSE:
+      if (d_cm >= (STUDY_NEAR_CM + STUDY_HYST_CM)) {
+        if (d_cm > (STUDY_FAR_CM + STUDY_HYST_CM)) return DST_TOO_FAR;
+        return DST_OK;
+      }
+      return DST_TOO_CLOSE;
+
+    case DST_TOO_FAR:
+      if (d_cm <= (STUDY_FAR_CM - STUDY_HYST_CM)) {
+        if (d_cm < (STUDY_NEAR_CM - STUDY_HYST_CM)) return DST_TOO_CLOSE;
+        return DST_OK;
+      }
+      return DST_TOO_FAR;
   }
-  return F("OK");
+  return prev;
+}
+
+static const __FlashStringHelper* distStateToText(uint8_t s) {
+  switch (s) {
+    case DST_TOO_CLOSE: return F("TOO_CLOSE");
+    case DST_OK:        return F("OK");
+    default:            return F("TOO_FAR");
+  }
+}
+
+// Edge-triggered notifications (LIGHT/SOUND)
+static void notifyIfChanged(Light::State currL, bool noisy) {
+  static bool first = true;
+  static Light::State prevL;
+  static bool prevNoisy;
+
+  if (first || currL != prevL) {
+    Serial.print(F("[LIGHT] ")); Serial.println(lightStateStr(currL));
+    prevL = currL;
+  }
+  if (first || noisy != prevNoisy) {
+    Serial.print(F("[SOUND] ")); Serial.println(noisy ? F("NOISY") : F("QUIET"));
+    prevNoisy = noisy;
+  }
+  first = false;
+}
+
+// Edge-triggered notifications (DISTANCE)
+static void notifyIfDistChanged(uint8_t s) {
+  static bool first = true;
+  static uint8_t prev = DST_OK;
+  if (first || s != prev) {
+    Serial.print(F("[DIST] ")); Serial.println(distStateToText(s));
+    if (s == DST_TOO_CLOSE) {
+      Serial.println(F("[WARN] Too close to screen — lean back."));
+    } else if (s == DST_TOO_FAR) {
+      Serial.println(F("[WARN] Too far — lean closer."));
+    }
+    prev = s;
+    first = false;
+  }
 }
 
 void setup() {
-  pinMode(LED, OUTPUT);
-  digitalWrite(LED, LOW);
-
   Serial.begin(115200);
-  while (!Serial) {}
+  delay(50);
 
-  Serial.println(F("\n[EnvTest] Booting..."));
-  // --- Light ---
+  // ---- LIGHT ----
   gLight.begin();
-  Serial.println(F("Auto-calibrating light (3s): sweep dark→bright→normal..."));
-  gLight.autoCalibrate(3000);
+  gLight.setThresholds(700, 900, 25);   // too dark <700, OK 750–900, too bright >900
 
-  // --- Sound ---
-  gSound.begin(PIN_MIC);
-  Serial.println(F("Calibrating sound baseline (2s): keep room at typical noise..."));
-  gSound.autoCalibrate(2000);
+  // ---- SOUND ----
+  pinMode(PIN_MIC, INPUT);
+  pinMode(LED_PIN, OUTPUT);
 
-  Serial.print(F("Light thr L/H/Hyst = "));
-  Serial.print(gLight.analogLow()); Serial.print(F("/"));
-  Serial.print(gLight.analogHigh()); Serial.print(F("/"));
-  Serial.println(gLight.hysteresis());
+  // ---- DISTANCE (HC-SR04) ----
+  gRange.begin();
 
-  Serial.print(F("Sound baseline=")); Serial.print(gSound.baseline());
-  Serial.print(F(", bands lo/hi="));  Serial.print(gSound.loBand());
-  Serial.print(F("/"));               Serial.println(gSound.hiBand());
+  // ---- Boot banner ----
+  Serial.println(F("=== SMART DESK MONITOR ==="));
+  Serial.print(F("Light thr: low="));  Serial.print(gLight.analogLow());
+  Serial.print(F(", high="));          Serial.print(gLight.analogHigh());
+  Serial.print(F(", hyst="));          Serial.println(gLight.hysteresis());
+  Serial.print(F("Sound thr: "));      Serial.println(SOUND_THRESHOLD);
+  Serial.print(F("Study dist OK: ["));
+  Serial.print(STUDY_NEAR_CM, 0); Serial.print(F(", "));
+  Serial.print(STUDY_FAR_CM, 0);  Serial.println(F("] cm"));
+  Serial.println(F("--------------------------------------------------"));
 }
 
 void loop() {
-  // --- Commands ---
-  if (Serial.available()) {
-    char c = (char)Serial.read();
-    if (c == 'c' || c == 'C') {
-      Serial.println(F("[Cmd] Re-calibrating light (3s)..."));
-      gLight.autoCalibrate(3000);
-    } else if (c == 's' || c == 'S') {
-      Serial.println(F("[Cmd] Re-calibrating sound (2s)..."));
-      gSound.autoCalibrate(2000);
-    } else if (c == 'h' || c == 'H') {
-      Serial.println(F("Commands: c=calibrate light, s=calibrate sound, h=help"));
-    }
-  }
-
-  // --- Update sensors ---
+  // ---- LIGHT ----
   gLight.update();
-  gSound.update();
 
-  // --- Combined logic & LED ---
-  EnvState env = classifyEnv(gLight, gSound);
-  static uint32_t lastBlink = 0;
-  static bool ledOn = false;
-  if (env == ENV_OK) {
-    digitalWrite(LED, HIGH);
-  } else {
-    uint32_t now = millis();
-    if (now - lastBlink >= 250) {
-      ledOn = !ledOn;
-      digitalWrite(LED, ledOn ? HIGH : LOW);
-      lastBlink = now;
+  // ---- SOUND ----
+  const int  soundRaw = analogRead(PIN_MIC);
+  const bool noisy    = (soundRaw > SOUND_THRESHOLD);
+  digitalWrite(LED_PIN, noisy ? HIGH : LOW);
+  notifyIfChanged(gLight.state(), noisy);
+
+  // ---- DISTANCE (sample ~3×/s) ----
+  static uint32_t tRangePrev = 0;
+  static uint8_t distS = DST_OK;
+  static float lastDcm = NAN;
+
+  if (millis() - tRangePrev >= 330) {
+    tRangePrev = millis();
+
+    // quick median for responsiveness
+    float d_cm = gRange.readCmMedian(3, 40);  // ~120 ms total
+    // Optional sanity clamp to reduce spurious spikes
+    if (!isnan(d_cm) && (d_cm < 2.0f || d_cm > 400.0f)) d_cm = NAN;
+
+    distS = evalDistState(distS, d_cm);
+    notifyIfDistChanged(distS);
+    lastDcm = d_cm; // keep the most recent reading for the 1 Hz line
+  }
+
+  // ---- Periodic neat status (1 Hz) ----
+  static uint32_t tPrev = 0;
+  if (millis() - tPrev > 1000) {
+    tPrev = millis();
+    // Format: LIGHT=<raw/state> | SOUND=<raw/state> | DIST=<cm/state>
+    Serial.print(F("LIGHT=")); Serial.print(gLight.raw());
+    Serial.print(F("/"));       Serial.print(lightStateStr(gLight.state()));
+    Serial.print(F(" | SOUND=")); Serial.print(soundRaw);
+    Serial.print(F("/"));         Serial.print(noisy ? F("NOISY") : F("QUIET"));
+    Serial.print(F(" | DIST="));
+    if (isnan(lastDcm)) {
+      Serial.print(F("--"));
+    } else {
+      Serial.print(lastDcm, 1);
     }
+    Serial.print(F("cm/")); Serial.println(distStateToText(distS));
   }
 
-  // --- Telemetry (for Serial Plotter) ---
-  static uint32_t lastPrint = 0;
-  uint32_t now = millis();
-  if (now - lastPrint >= 200) {
-    lastPrint = now;
-    Serial.print(F("t="));       Serial.print(now);
-    Serial.print(F(",Lraw="));   Serial.print(gLight.raw());
-    Serial.print(F(",Lsmooth="));Serial.print((int)gLight.smooth());
-    Serial.print(F(",Lstate=")); Serial.print((int)gLight.state());
-    Serial.print(F(",Savg="));   Serial.print(gSound.avg());
-    Serial.print(F(",Sbase="));  Serial.print(gSound.baseline());
-    Serial.print(F(",Sstate=")); Serial.print((int)gSound.state()); // 0=QUIET,1=NOISY
-    Serial.print(F(",ENV="));    Serial.println(envName(env));
-  }
-
+  // Keep loop responsive
   delay(1);
 }
