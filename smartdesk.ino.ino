@@ -2,7 +2,7 @@
 #include "dist.h"   // distance sensor functions
 #include "ldr.h"    // light sensor functions
 #include "rfid.h"   // RFID functions
-
+#include "sound.h"
 // print every 500 ms
 const uint32_t PRINT_INTERVAL = 500;
 uint32_t lastPrint = 0;
