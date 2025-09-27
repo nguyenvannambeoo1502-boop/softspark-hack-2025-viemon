@@ -4,20 +4,23 @@
 
 // ---------------- Pins ----------------
 static const uint8_t PIN_LIGHT = A0;   // Light sensor analog
-static const uint8_t PIN_MIC   = A1;   // Sound sensor analog
-static const uint8_t LED_PIN   = 13;   // Built-in LED
+static const uint8_t PIN_THERM = A1;   // Thermistor analog
 static const uint8_t PIN_TRIG  = 9;
 static const uint8_t PIN_ECHO  = 8;
-
-// Button
-static const uint8_t BTN_PIN = 7;
+static const uint8_t BTN_PIN   = 7;
 
 // ---------------- Instances ----------------
 Light  gLight(PIN_LIGHT, 5.0f, 10000.0f, 0.20f);
 HCSR04 gRange(PIN_TRIG, PIN_ECHO);
 
-// ---------------- Thresholds ----------------
-const int SOUND_THRESHOLD = 55;
+// ---------------- Thermistor params ----------------
+static const float THERM_R0     = 10000.0f;   // 10k at 25 °C
+static const float THERM_T0_C   = 25.0f;
+static const float THERM_BETA   = 3950.0f;
+static const float THERM_R_SER  = 10000.0f;
+static const float ADC_MAX      = 1023.0f;
+
+// ---------------- Distance thresholds ----------------
 const float STUDY_NEAR_CM = 35.0f;
 const float STUDY_FAR_CM  = 75.0f;
 const float STUDY_HYST_CM = 3.0f;
@@ -48,15 +51,27 @@ static const __FlashStringHelper* distStateToText(uint8_t s) {
   }
 }
 
+// Thermistor conversion
+static float thermistorResistance(int adc) {
+  if (adc <= 0 || adc >= 1023) return NAN;
+  return THERM_R_SER * (ADC_MAX / (float)adc - 1.0f);
+}
+
+static float thermistorTempC(float R) {
+  if (!(R > 0.0f)) return NAN;
+  const float T0_K = THERM_T0_C + 273.15f;
+  float invT = (1.0f / T0_K) + (1.0f / THERM_BETA) * log(R / THERM_R0);
+  return (1.0f / invT) - 273.15f;
+}
+
 // ---------------- Global enable ----------------
 static bool sensorsEnabled = true;
 
-// Simple button toggle
 static void checkButton() {
   static bool lastState = HIGH;
   bool state = digitalRead(BTN_PIN);
 
-  if (lastState == HIGH && state == LOW) { // falling edge (pressed)
+  if (lastState == HIGH && state == LOW) {
     sensorsEnabled = !sensorsEnabled;
     Serial.print(F("[MODE] Sensors "));
     Serial.println(sensorsEnabled ? F("ENABLED") : F("DISABLED"));
@@ -68,39 +83,37 @@ void setup() {
   Serial.begin(115200);
   delay(50);
 
-  // Button uses INPUT_PULLUP (connect between pin and GND)
   pinMode(BTN_PIN, INPUT_PULLUP);
-
   gLight.begin();
   gLight.setThresholds(700, 900, 25);
-  pinMode(PIN_MIC, INPUT);
-  pinMode(LED_PIN, OUTPUT);
+  pinMode(PIN_THERM, INPUT);
   gRange.begin();
 
-  Serial.println(F("=== SMART DESK MONITOR ==="));
+  Serial.println(F("=== SMART DESK MONITOR (Light + Thermistor + Distance) ==="));
 }
 
 void loop() {
   checkButton();
-
-  if (!sensorsEnabled) {
-    delay(10);
-    return;
-  }
+  if (!sensorsEnabled) { delay(10); return; }
 
   // ---- LIGHT ----
   gLight.update();
 
-  // ---- SOUND ----
-  int  soundRaw = analogRead(PIN_MIC);
-  bool noisy    = (soundRaw > SOUND_THRESHOLD);
-  digitalWrite(LED_PIN, noisy ? HIGH : LOW);
+  // ---- THERMISTOR ----
+  int   adc    = analogRead(PIN_THERM);
+  float rTherm = thermistorResistance(adc);
+  float tempC  = thermistorTempC(rTherm);
+
+  const __FlashStringHelper* tempState;
+  if (isnan(tempC))           tempState = F("N/A");
+  else if (tempC < 20.0f)     tempState = F("TOO_COLD");
+  else if (tempC <= 30.0f)    tempState = F("OK");
+  else                        tempState = F("TOO_HOT");
 
   // ---- DISTANCE ----
   static uint32_t tRangePrev = 0;
   static uint8_t distS = DST_OK;
   static float lastDcm = NAN;
-
   if (millis() - tRangePrev >= 330) {
     tRangePrev = millis();
     float d_cm = gRange.readCmMedian(3, 40);
@@ -115,8 +128,13 @@ void loop() {
     tPrev = millis();
     Serial.print(F("LIGHT=")); Serial.print(gLight.raw());
     Serial.print(F("/")); Serial.print(lightStateStr(gLight.state()));
-    Serial.print(F(" | SOUND=")); Serial.print(soundRaw);
-    Serial.print(F("/")); Serial.print(noisy ? F("NOISY") : F("QUIET"));
+
+    Serial.print(F(" | TEMP="));
+    if (isnan(tempC)) Serial.print(F("--"));
+    else Serial.print(tempC, 1);
+    Serial.print(F("C/")); 
+    Serial.print(tempState);
+
     Serial.print(F(" | DIST="));
     if (isnan(lastDcm)) Serial.print(F("--"));
     else Serial.print(lastDcm, 1);
